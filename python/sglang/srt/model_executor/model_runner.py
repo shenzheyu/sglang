@@ -74,6 +74,8 @@ from sglang.srt.utils import (
     set_cuda_arch,
 )
 
+from torch.profiler import profile, ProfilerActivity
+
 logger = logging.getLogger(__name__)
 
 
@@ -778,17 +780,31 @@ class ModelRunner:
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
-            if forward_batch.input_embeds is None:
-                return self.model.forward(
-                    forward_batch.input_ids, forward_batch.positions, forward_batch
-                )
-            else:
-                return self.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    input_embeds=forward_batch.input_embeds.bfloat16(),
-                )
+            def trace_handler(prof):
+                if torch.distributed.get_rank() == 0:
+                    prof.export_chrome_trace("/workspace/traces/olmoe_ep.json")
+
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                schedule=torch.profiler.schedule(wait=0, warmup=0, active=3),
+                on_trace_ready=trace_handler
+            ) as prof:
+                if forward_batch.input_embeds is None:
+                    res = self.model.forward(
+                        forward_batch.input_ids, forward_batch.positions, forward_batch
+                    )
+                    prof.step()
+                    return res
+                else:
+                    res = self.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        input_embeds=forward_batch.input_embeds.bfloat16(),
+                    )
+                    prof.step()
+                    return res
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(
