@@ -134,6 +134,7 @@ class EPMoE(torch.nn.Module):
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
+        self.active_expert_ids = list(range((self.tp_rank + 1) % 8, (self.tp_rank + 1) % 8 + self.num_experts_per_partition))
 
         self.top_k = top_k
         self.intermediate_size = intermediate_size
@@ -230,12 +231,21 @@ class EPMoE(torch.nn.Module):
             self.w13_input_scale,
             self.start_expert_id,
             self.end_expert_id,
+            self.active_expert_ids
             self.top_k,
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        # seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        # Create a tensor of active expert IDs 
+        active_expert_ids_tensor = torch.tensor(self.active_expert_ids, device=seg_indptr.device, dtype=torch.int64)
+        # Add one past the max expert ID to get the ending pointer
+        end_pointer = torch.tensor([max(self.active_expert_ids) + 1], device=seg_indptr.device, dtype=torch.int64)
+        # Concatenate to get indices for all the pointers we need
+        indices_tensor = torch.cat([active_expert_ids_tensor, end_pointer])
+        # Select the pointers for our active experts
+        seg_indptr_cur_rank = torch.index_select(seg_indptr, 0, indices_tensor)
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -294,6 +304,7 @@ class EPMoE(torch.nn.Module):
                 self.w2_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
+                self.active_expert_ids,
                 BLOCK_SIZE=512,
             )
         else:
@@ -334,6 +345,7 @@ class EPMoE(torch.nn.Module):
             topk_weights,
             self.start_expert_id,
             self.end_expert_id,
+            self.active_expert_ids,
             self.top_k,
             hidden_states.size(1),
             BLOCK_SIZE=512,
@@ -376,9 +388,11 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+        # if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+        if not expert_id in self.active_expert_ids:
             return
-        expert_id = expert_id - self.start_expert_id
+        # expert_id = expert_id - self.start_expert_id
+        expert_id = self.active_expert_ids.index(expert_id)
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
