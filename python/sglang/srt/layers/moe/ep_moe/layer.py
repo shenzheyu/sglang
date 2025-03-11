@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch.nn import Module
+import torch.nn.functional as F
 from vllm import _custom_ops as ops
 
 from sglang.srt.custom_op import CustomOp
@@ -94,6 +95,95 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         return c
 
+
+def run_moe_ep_preproess_native(topk_ids: torch.Tensor, num_experts: int):
+    topk_ids_flat = topk_ids.view(-1)
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids_flat, stable=True)
+    num_toks = topk_ids_flat.numel()
+    # Compute seg_indptr
+    experts = torch.arange(1, num_experts + 1, device=topk_ids.device)
+    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+    seg_indptr[1:] = torch.searchsorted(reorder_topk_ids, experts, right=False)
+    # Build the src2dst mapping
+    src2dst = torch.empty_like(reorder_ids, dtype=torch.int32)
+    src2dst[reorder_ids] = torch.arange(num_toks, device=topk_ids.device, dtype=torch.int32)
+    return reorder_topk_ids, src2dst, seg_indptr
+
+def pre_reorder_native(hidden_states: torch.Tensor, topk_ids: torch.Tensor,
+                        src2dst: torch.Tensor, a1_scales: Optional[torch.Tensor],
+                        start_expert_id: int):
+    """
+    Reorders the input token representations (hidden_states) based on the
+    topk routing decisions and applies per-token scaling.
+    
+    Each token in hidden_states (shape [N, H]) is broadcasted to a new tensor of shape
+    [N * top_k, H] at positions determined by src2dst. For each valid top-k entry (i.e. where
+    the expert id falls in the local range) the token is scaled by (1 / a1_scale) if provided.
+    """
+    N, H = hidden_states.shape
+    topk = topk_ids.shape[1]
+    # Allocate output tensor (to be used in GEMM later)
+    gateup_input = torch.empty((N * topk, H), device=hidden_states.device, dtype=hidden_states.dtype)
+    # Flatten topk_ids and compute corresponding token indices
+    flat_topk_ids = topk_ids.view(-1)
+    token_ids = torch.arange(N, device=hidden_states.device).unsqueeze(1).expand(N, topk).reshape(-1)
+    # Select only those entries where the expert id is in the current partition.
+    valid_mask = flat_topk_ids >= start_expert_id
+    valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(1)
+    # Determine per-token scale (if provided)
+    if a1_scales is not None:
+        # Adjust expert index relative to the local partition
+        scales = 1.0 / a1_scales[(flat_topk_ids[valid_indices] - start_expert_id).long()]
+    else:
+        scales = 1.0
+    # Write the (optionally scaled) token representations into gateup_input
+    # at positions determined by the src2dst mapping.
+    gateup_input[src2dst[valid_indices]] = hidden_states[token_ids[valid_indices]] * scales.unsqueeze(1)
+    return gateup_input
+
+def grouped_gemm_native(a: torch.Tensor, weight: torch.Tensor,
+                         seg_indptr: torch.Tensor, start_expert_id: int,
+                         end_expert_id: int):
+    M, input_dim = a.shape
+    num_experts = weight.shape[0]
+    output_dim = weight.shape[1]
+    out = torch.empty((M, output_dim), device=a.device, dtype=a.dtype)
+    for i in range(num_experts):
+        start = int(seg_indptr[i].item())
+        end = int(seg_indptr[i+1].item())
+        if start < end:
+            a_slice = a[start:end]              # shape: [n_i, input_dim]
+            w = weight[i]                       # shape: [output_dim, input_dim]
+            out[start:end] = a_slice @ w.t()
+    return out
+
+def post_reorder_pytorch(down_output: torch.Tensor, topk_ids: torch.Tensor,
+                         src2dst: torch.Tensor, topk_weights: torch.Tensor,
+                         start_expert_id: int):
+    """
+    Gathers the expert outputs and aggregates them back into the final output.
+    For each token (row), it sums over the top-k contributions weighted by topk_weights.
+    
+    down_output: tensor of shape [M, hidden_size] (output of the second GEMM)
+    topk_ids: original top-k expert ids of shape [N, top_k]
+    src2dst: reordering mapping of shape [N * top_k]
+    topk_weights: weights from the routing (shape [N, top_k])
+    
+    Returns a tensor of shape [N, hidden_size].
+    """
+    N, topk = topk_ids.shape
+    H = down_output.shape[1]
+    output = torch.zeros((N, H), device=down_output.device, dtype=down_output.dtype)
+    flat_topk_ids = topk_ids.view(-1)
+    token_ids = torch.arange(N, device=down_output.device).unsqueeze(1).expand(N, topk).reshape(-1)
+    # Only aggregate contributions from experts in the local range.
+    valid_mask = flat_topk_ids >= start_expert_id
+    valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(1)
+    # Multiply each expert’s output with its corresponding routing weight.
+    contributions = topk_weights.view(-1)[valid_indices].unsqueeze(1) * down_output[valid_indices]
+    # Use scatter-add to accumulate contributions per token.
+    output = output.index_add(0, token_ids[valid_indices], contributions)
+    return output
 
 class EPMoE(torch.nn.Module):
     """
@@ -200,7 +290,7 @@ class EPMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
-        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess_native(
             topk_ids, self.num_experts
         )
 
@@ -222,133 +312,158 @@ class EPMoE(torch.nn.Module):
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
         # PreReorder
-        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            gateup_input,
-            src2dst,
-            topk_ids,
-            self.w13_input_scale,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states.shape[1],
-            BLOCK_SIZE=512,
+        # pre_reorder_triton_kernel[(hidden_states.shape[0],)](
+        #     hidden_states,
+        #     gateup_input,
+        #     src2dst,
+        #     topk_ids,
+        #     self.w13_input_scale,
+        #     self.start_expert_id,
+        #     self.end_expert_id,
+        #     self.top_k,
+        #     hidden_states.shape[1],
+        #     BLOCK_SIZE=512,
+        # )
+        gateup_input = pre_reorder_native(
+            hidden_states, topk_ids, src2dst, self.w13_input_scale, self.start_expert_id
         )
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
-        weight_indices_cur_rank = torch.arange(
-            0,
-            self.num_experts_per_partition,
-            device=hidden_states.device,
-            dtype=torch.int64,
-        )
+        # seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        # weight_indices_cur_rank = torch.arange(
+        #     0,
+        #     self.num_experts_per_partition,
+        #     device=hidden_states.device,
+        #     dtype=torch.int64,
+        # )
         # GroupGemm-0
-        gateup_output = torch.empty(
-            gateup_input.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        gateup_output = self.grouped_gemm_runner(
-            a=gateup_input,
-            b=self.w13_weight,
-            c=gateup_output,
-            batch_size=self.num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w13_input_scale,
-            scale_b=(
-                self.w13_weight_scale_inv
-                if self.use_block_quant
-                else self.w13_weight_scale
-            ),
-            block_shape=self.block_shape,
+        # gateup_output = torch.empty(
+        #     gateup_input.shape[0],
+        #     self.w13_weight.shape[1],
+        #     device=hidden_states.device,
+        #     dtype=hidden_states.dtype,
+        # )
+        # gateup_output = self.grouped_gemm_runner(
+        #     a=gateup_input,
+        #     b=self.w13_weight,
+        #     c=gateup_output,
+        #     batch_size=self.num_experts_per_partition,
+        #     weight_column_major=True,
+        #     seg_indptr=seg_indptr_cur_rank,
+        #     weight_indices=weight_indices_cur_rank,
+        #     use_fp8_w8a8=self.use_fp8_w8a8,
+        #     scale_a=self.w13_input_scale,
+        #     scale_b=(
+        #         self.w13_weight_scale_inv
+        #         if self.use_block_quant
+        #         else self.w13_weight_scale
+        #     ),
+        #     block_shape=self.block_shape,
+        # )
+        seg_indptr_cur = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        # w13_weight: [num_experts_per_partition, 2 * intermediate_size, hidden_size]
+        gateup_output = grouped_gemm_native(
+            gateup_input, self.w13_weight, seg_indptr_cur, self.start_expert_id, self.end_expert_id
         )
 
         # Act
-        down_input = torch.empty(
-            gateup_output.shape[0],
-            gateup_output.shape[1] // 2,
-            device=gateup_output.device,
-            dtype=(
-                self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states.dtype
-            ),
-        )
-        if self.w2_input_scale is None and not self.use_block_quant:
-            self.w2_input_scale = torch.ones(
-                self.num_experts_per_partition,
-                dtype=torch.float32,
-                device=hidden_states.device,
-            )
+        # down_input = torch.empty(
+        #     gateup_output.shape[0],
+        #     gateup_output.shape[1] // 2,
+        #     device=gateup_output.device,
+        #     dtype=(
+        #         self.fp8_dtype
+        #         if (self.use_fp8_w8a8 and not self.use_block_quant)
+        #         else hidden_states.dtype
+        #     ),
+        # )
+        # if self.w2_input_scale is None and not self.use_block_quant:
+        #     self.w2_input_scale = torch.ones(
+        #         self.num_experts_per_partition,
+        #         dtype=torch.float32,
+        #         device=hidden_states.device,
+        #     )
 
+        # if self.activation == "silu":
+        #     silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+        #         gateup_output,
+        #         down_input,
+        #         gateup_output.shape[1],
+        #         reorder_topk_ids,
+        #         self.w2_input_scale,
+        #         self.start_expert_id,
+        #         self.end_expert_id,
+        #         BLOCK_SIZE=512,
+        #     )
+        # elif self.activation == "gelu":
+        #     gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+        #         gateup_output,
+        #         down_input,
+        #         gateup_output.shape[1],
+        #         reorder_topk_ids,
+        #         self.w2_input_scale,
+        #         self.start_expert_id,
+        #         self.end_expert_id,
+        #         BLOCK_SIZE=512,
+        #     )
+        # else:
+        #     raise ValueError(f"Unsupported activation: {self.activation=}")
+        half_dim = gateup_output.shape[1] // 2
+        gate_part = gateup_output[:, :half_dim]
+        up_part = gateup_output[:, half_dim:]
+        scales = 1.0 / self.w2_input_scale[(reorder_topk_ids - self.start_expert_id).long()] \
+            if self.w2_input_scale is not None else 1.0
+        scales = scales.unsqueeze(1)  # [M, 1]
         if self.activation == "silu":
-            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-                gateup_output,
-                down_input,
-                gateup_output.shape[1],
-                reorder_topk_ids,
-                self.w2_input_scale,
-                self.start_expert_id,
-                self.end_expert_id,
-                BLOCK_SIZE=512,
-            )
+            activated = gate_part * torch.sigmoid(gate_part)
         elif self.activation == "gelu":
-            gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-                gateup_output,
-                down_input,
-                gateup_output.shape[1],
-                reorder_topk_ids,
-                self.w2_input_scale,
-                self.start_expert_id,
-                self.end_expert_id,
-                BLOCK_SIZE=512,
-            )
+            activated = F.gelu(gate_part)
         else:
-            raise ValueError(f"Unsupported activation: {self.activation=}")
+            raise ValueError(f"Unsupported activation: {self.activation}")
+        down_input = activated * up_part * scales
 
         # GroupGemm-1
-        down_output = torch.empty(
-            down_input.shape[0],
-            self.w2_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        down_output = self.grouped_gemm_runner(
-            a=down_input,
-            b=self.w2_weight,
-            c=down_output,
-            batch_size=self.num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w2_input_scale,
-            scale_b=(
-                self.w2_weight_scale_inv
-                if self.use_block_quant
-                else self.w2_weight_scale
-            ),
-            block_shape=self.block_shape,
+        # down_output = torch.empty(
+        #     down_input.shape[0],
+        #     self.w2_weight.shape[1],
+        #     device=hidden_states.device,
+        #     dtype=hidden_states.dtype,
+        # )
+        # down_output = self.grouped_gemm_runner(
+        #     a=down_input,
+        #     b=self.w2_weight,
+        #     c=down_output,
+        #     batch_size=self.num_experts_per_partition,
+        #     weight_column_major=True,
+        #     seg_indptr=seg_indptr_cur_rank,
+        #     weight_indices=weight_indices_cur_rank,
+        #     use_fp8_w8a8=self.use_fp8_w8a8,
+        #     scale_a=self.w2_input_scale,
+        #     scale_b=(
+        #         self.w2_weight_scale_inv
+        #         if self.use_block_quant
+        #         else self.w2_weight_scale
+        #     ),
+        #     block_shape=self.block_shape,
+        # )
+        down_output = grouped_gemm_native(
+            down_input, self.w2_weight, seg_indptr_cur, self.start_expert_id, self.end_expert_id
         )
 
         # PostReorder
-        output = torch.empty_like(hidden_states)
-        post_reorder_triton_kernel[(hidden_states.size(0),)](
-            down_output,
-            output,
-            src2dst,
-            topk_ids,
-            topk_weights,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states.size(1),
-            BLOCK_SIZE=512,
-        )
+        # output = torch.empty_like(hidden_states)
+        # post_reorder_triton_kernel[(hidden_states.size(0),)](
+        #     down_output,
+        #     output,
+        #     src2dst,
+        #     topk_ids,
+        #     topk_weights,
+        #     self.start_expert_id,
+        #     self.end_expert_id,
+        #     self.top_k,
+        #     hidden_states.size(1),
+        #     BLOCK_SIZE=512,
+        # )
+        output = post_reorder_pytorch(down_output, topk_ids, src2dst, topk_weights, self.start_expert_id)
         return output
 
     @classmethod
