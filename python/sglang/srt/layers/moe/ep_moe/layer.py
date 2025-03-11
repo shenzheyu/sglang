@@ -231,7 +231,7 @@ class EPMoE(torch.nn.Module):
             self.w13_input_scale,
             self.start_expert_id,
             self.end_expert_id,
-            self.active_expert_ids
+            self.active_expert_ids,
             self.top_k,
             hidden_states.shape[1],
             BLOCK_SIZE=512,
