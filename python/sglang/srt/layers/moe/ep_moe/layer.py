@@ -97,15 +97,16 @@ class GroupedGemmRunner(torch.nn.Module):
 
 
 def run_moe_ep_preproess_native(topk_ids: torch.Tensor, num_experts: int):
-    topk_ids_flat = topk_ids.view(-1)
-    reorder_topk_ids, reorder_ids = torch.sort(topk_ids_flat, stable=True)
-    num_toks = topk_ids_flat.numel()
-    # Compute seg_indptr
-    experts = torch.arange(1, num_experts + 1, device=topk_ids.device)
+    # topk_ids: [N, top_k] e.g. [[2, 0, 1], [1, 2, 0]]
+    # reorder_topk_ids: [N * top_k] e.g. [0, 0, 1, 1, 2, 2]
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    num_toks = topk_ids.numel()
+    # seg_indptr: [num_experts + 1] e.g. [0, 2, 4, 6]
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
-    seg_indptr[1:] = torch.searchsorted(reorder_topk_ids, experts, right=False)
-    # Build the src2dst mapping
-    src2dst = torch.empty_like(reorder_ids, dtype=torch.int32)
+    experts = torch.arange(num_experts, device=topk_ids.device)
+    seg_indptr[1:] = torch.searchsorted(reorder_topk_ids, experts, right=True)
+    # src2dst: [N * top_k] e.g. [4, 0, 2, 3, 5, 1]
+    src2dst = torch.empty(num_toks, device=topk_ids.device, dtype=torch.int32)
     src2dst[reorder_ids] = torch.arange(num_toks, device=topk_ids.device, dtype=torch.int32)
     return reorder_topk_ids, src2dst, seg_indptr
 
