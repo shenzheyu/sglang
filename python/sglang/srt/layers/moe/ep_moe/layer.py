@@ -110,10 +110,22 @@ def run_moe_ep_preproess_native(topk_ids: torch.Tensor, num_experts: int):
     src2dst[reorder_ids] = torch.arange(num_toks, device=topk_ids.device, dtype=torch.int32)
     return reorder_topk_ids, src2dst, seg_indptr
 
-def pre_reorder_native(input, src2dst, topk_ids, a1_scales, start_expert_id, end_expert_id, topk, hidden_size):
+def pre_reorder_native(
+    input: torch.Tensor,
+    src2dst: torch.Tensor,
+    topk_ids: torch.Tensor,
+    a1_scales: torch.Tensor,
+    start_expert_id: int,
+    end_expert_id: int,
+    topk: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+):
     token_num = input.shape[0]
-    out = torch.zeros((token_num * topk, hidden_size), device=input.device, dtype=input.dtype)
-    
+    out = torch.zeros(
+        (token_num * topk, hidden_size), device=input.device, dtype=dtype
+    )
+
     for i in range(token_num):
         src = input[i]  # [hidden_size]
         for j in range(topk):
@@ -124,7 +136,7 @@ def pre_reorder_native(input, src2dst, topk_ids, a1_scales, start_expert_id, end
                 else:
                     scale = 1.0
                 dst_idx = int(src2dst[i * topk + j].item())
-                scaled = (src.to(torch.float32) * scale).to(input.dtype)
+                scaled = (src.to(torch.float32) * scale).to(dtype)
                 out[dst_idx, :] = scaled
     return out
 
@@ -135,6 +147,7 @@ def silu_and_mul_native(
     scales: torch.Tensor,
     start_expert_id: int,
     end_expert_id: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     half_hidden_size = hidden_size // 2
     M = gateup_output.shape[0]
@@ -171,8 +184,8 @@ def gelu_and_mul_native(
     scales: torch.Tensor,
     start_expert_id: int,
     end_expert_id: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    dtype = gateup_output.dtype
     half_hidden_size = hidden_size // 2
     M = gateup_output.shape[0]
     
@@ -344,15 +357,15 @@ class EPMoE(torch.nn.Module):
             topk_ids, self.num_experts
         )
 
-        gateup_input = torch.empty(
-            (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
-            device=hidden_states.device,
-            dtype=(
-                self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states.dtype
-            ),
-        )
+        # gateup_input = torch.empty(
+        #     (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
+        #     device=hidden_states.device,
+        #     dtype=(
+        #         self.fp8_dtype
+        #         if (self.use_fp8_w8a8 and not self.use_block_quant)
+        #         else hidden_states.dtype
+        #     ),
+        # )
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
                 torch.max(hidden_states)
@@ -374,8 +387,21 @@ class EPMoE(torch.nn.Module):
         #     hidden_states.shape[1],
         #     BLOCK_SIZE=512,
         # )
-        gateup_input = pre_reorder_native(hidden_states, src2dst, topk_ids, self.w13_input_scale,
-                                          self.start_expert_id, self.end_expert_id, self.top_k, hidden_states.shape[1])
+        gateup_input = pre_reorder_native(
+            hidden_states,
+            src2dst,
+            topk_ids,
+            self.w13_input_scale,
+            self.start_expert_id,
+            self.end_expert_id,
+            self.top_k,
+            hidden_states.shape[1],
+            dtype=(
+                self.fp8_dtype
+                if (self.use_fp8_w8a8 and not self.use_block_quant)
+                else hidden_states.dtype
+            ),
+        )
 
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
@@ -445,6 +471,11 @@ class EPMoE(torch.nn.Module):
                 self.w2_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
+                dtype=(
+                    self.fp8_dtype
+                    if (self.use_fp8_w8a8 and not self.use_block_quant)
+                    else hidden_states.dtype
+                ),
             )
         elif self.activation == "gelu":
             # gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
@@ -464,6 +495,11 @@ class EPMoE(torch.nn.Module):
                 self.w2_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
+                dtype=(
+                    self.fp8_dtype
+                    if (self.use_fp8_w8a8 and not self.use_block_quant)
+                    else hidden_states.dtype
+                ),
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")

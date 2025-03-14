@@ -99,6 +99,7 @@ class TestPreReorderNative(unittest.TestCase):
             end_expert_id,
             top_k,
             hidden_states.shape[1],
+            dtype=hidden_states.dtype,
         )
 
         # print(
@@ -152,6 +153,7 @@ class TestSiluAndMulNative(unittest.TestCase):
             end_expert_id,
             top_k,
             hidden_states.shape[1],
+            dtype=hidden_states.dtype,
         )
 
         seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
@@ -219,6 +221,7 @@ class TestSiluAndMulNative(unittest.TestCase):
             w2_input_scale,
             start_expert_id,
             end_expert_id,
+            dtype=hidden_states.dtype,
         )
 
         # print(f"Expected down_input: {expected_down_input}, got: {down_input}")
@@ -270,6 +273,7 @@ class TestGeluAndMulNative(unittest.TestCase):
             end_expert_id,
             top_k,
             hidden_states.shape[1],
+            dtype=hidden_states.dtype,
         )
 
         seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
@@ -337,6 +341,7 @@ class TestGeluAndMulNative(unittest.TestCase):
             w2_input_scale,
             start_expert_id,
             end_expert_id,
+            dtype=hidden_states.dtype,
         )
 
         # print(f"Expected down_input: {expected_down_input}, got: {down_input}")
@@ -388,6 +393,7 @@ class TestPostReorderNative(unittest.TestCase):
             end_expert_id,
             top_k,
             hidden_states.shape[1],
+            dtype=hidden_states.dtype,
         )
 
         seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
@@ -439,6 +445,7 @@ class TestPostReorderNative(unittest.TestCase):
             w2_input_scale,
             start_expert_id,
             end_expert_id,
+            hidden_states.dtype,
         )
 
         w2_weight = torch.randn(
