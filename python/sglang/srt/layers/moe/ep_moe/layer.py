@@ -110,68 +110,101 @@ def run_moe_ep_preproess_native(topk_ids: torch.Tensor, num_experts: int):
     src2dst[reorder_ids] = torch.arange(num_toks, device=topk_ids.device, dtype=torch.int32)
     return reorder_topk_ids, src2dst, seg_indptr
 
-def pre_reorder_native(input_tensor: torch.Tensor,
-                       src2dst: torch.Tensor,
-                       topk_ids: torch.Tensor,
-                       a1_scales: Optional[torch.Tensor],
-                       start_expert_id: int,
-                       end_expert_id: int,
-                       topk: int,
-                       hidden_size: int):
-    N = input_tensor.size(0)
-    num_elements = N * topk
-
-    # expert_id = tl.load(topk_ids_ptr + idx)
-    #     if expert_id >= start_expert_id and expert_id <= end_expert_id:
-    flat_topk_ids = topk_ids.view(-1)
-    valid_mask = (flat_topk_ids >= start_expert_id) & (flat_topk_ids <= end_expert_id)
+def pre_reorder_native(input, src2dst, topk_ids, a1_scales, start_expert_id, end_expert_id, topk, hidden_size):
+    token_num = input.shape[0]
+    out = torch.zeros((token_num * topk, hidden_size), device=input.device, dtype=input.dtype)
     
-    # if a1_scales_ptr is not None:
-    #     scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
-    # else:
-    #     scale = 1.0
-    if a1_scales is not None:
-        valid_expert_ids = flat_topk_ids[valid_mask]
-        scales = 1.0 / a1_scales[(valid_expert_ids - start_expert_id).long()]
-    else:
-        scales = 1.0
-
-    # offset = start_offset + tl.arange(0, BLOCK_SIZE)
-    # mask = offset < hidden_size
-    indices = torch.arange(num_elements, device=input_tensor.device)
-    token_indices = indices // topk
-    valid_token_indices = token_indices[valid_mask]
-    selected_tokens = input_tensor[valid_token_indices]
-
-    # in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
-    # out_data = (in_data * scale).to(OutDtype)
-    # tl.store(dst_ptr + offset, out_data, mask=mask)
-    if isinstance(scales, torch.Tensor):
-        scaled_tokens = selected_tokens * scales.unsqueeze(1)
-    else:
-        scaled_tokens = selected_tokens * scales
-    flat_src2dst = src2dst.view(-1)
-    valid_dst_indices = flat_src2dst[valid_mask]
-    gateup_input = torch.empty((num_elements, hidden_size), device=input_tensor.device, dtype=input_tensor.dtype)
-    gateup_input[valid_dst_indices] = scaled_tokens
-
-    return gateup_input
-
-def grouped_gemm_native(a: torch.Tensor, weight: torch.Tensor,
-                         seg_indptr: torch.Tensor, start_expert_id: int,
-                         end_expert_id: int):
-    M, input_dim = a.shape
-    num_experts = weight.shape[0]
-    output_dim = weight.shape[1]
-    out = torch.empty((M, output_dim), device=a.device, dtype=a.dtype)
-    for i in range(num_experts):
-        start = int(seg_indptr[i].item())
-        end = int(seg_indptr[i+1].item())
-        if start < end:
-            a_slice = a[start:end] # [n_i, input_dim]
-            w = weight[i] # [output_dim, input_dim]
-            out[start:end] = a_slice @ w.t()
+    for i in range(token_num):
+        src = input[i]  # [hidden_size]
+        for j in range(topk):
+            expert_id = int(topk_ids[i, j].item())
+            if start_expert_id <= expert_id <= end_expert_id:
+                if a1_scales is not None:
+                    scale = 1.0 / a1_scales[expert_id - start_expert_id]
+                else:
+                    scale = 1.0
+                dst_idx = int(src2dst[i * topk + j].item())
+                scaled = (src.to(torch.float32) * scale).to(input.dtype)
+                out[dst_idx, :] = scaled
     return out
+
+def silu_and_mul_native(
+    gateup_output: torch.Tensor,
+    hidden_size: int,
+    reorder_topk_ids: torch.Tensor,
+    scales: torch.Tensor,
+    start_expert_id: int,
+    end_expert_id: int,
+) -> torch.Tensor:
+    half_hidden_size = hidden_size // 2
+    M = gateup_output.shape[0]
+    down_input = torch.zeros((M, half_hidden_size), device=gateup_output.device, dtype=gateup_output.dtype)
+
+    for pid in range(M):
+        expert_id = int(reorder_topk_ids[pid].item())
+        if start_expert_id <= expert_id <= end_expert_id:
+            row = gateup_output[pid]
+            gate_output = row[:half_hidden_size]
+            up_output = row[half_hidden_size:]
+
+            if scales is not None:
+                scale_val = scales[expert_id - start_expert_id]
+                scale = (1.0 / scale_val).to(gateup_output.dtype)
+            else:
+                scale = 1.0
+
+            gate_float = gate_output.to(torch.float32)
+            silu_output = gate_float * torch.sigmoid(gate_float)
+            silu_output = silu_output.to(gateup_output.dtype)
+
+            result = silu_output * up_output * scale
+            down_input[pid] = result
+        else:
+            down_input[pid].zero_()
+
+    return down_input
+
+def gelu_and_mul_native(
+    gateup_output: torch.Tensor,
+    hidden_size: int,
+    reorder_topk_ids: torch.Tensor,
+    scales: torch.Tensor,
+    start_expert_id: int,
+    end_expert_id: int,
+) -> torch.Tensor:
+    dtype = gateup_output.dtype
+    half_hidden_size = hidden_size // 2
+    M = gateup_output.shape[0]
+    
+    down_input = torch.empty((M, half_hidden_size), device=gateup_output.device, dtype=dtype)
+    
+    kAlpha = 0.7978845608028654
+
+    for pid in range(M):
+        expert_id = int(reorder_topk_ids[pid].item())
+        if start_expert_id <= expert_id <= end_expert_id:
+            row = gateup_output[pid]
+            gate_output = row[:half_hidden_size]
+            up_output = row[half_hidden_size:]
+
+            if scales is not None:
+                scale_val = scales[expert_id - start_expert_id]
+                scale = (1.0 / scale_val).to(dtype)
+            else:
+                scale = 1.0
+            
+            gate_float = gate_output.to(torch.float32)
+            # GELU formula: 0.5 * x * (1 + tanh(kAlpha*(x + 0.044715*x^3)))
+            gelu = 0.5 * gate_float * (1.0 + torch.tanh(kAlpha * (gate_float + 0.044715 * gate_float**3)))
+            gelu = gelu.to(dtype)
+            
+            gelu_mul_output = gelu * up_output * scale
+            gelu_mul_output = gelu_mul_output.to(dtype)
+            down_input[pid] = gelu_mul_output
+        else:
+            down_input[pid].zero_()
+
+    return down_input
 
 def post_reorder_native(
     down_output: torch.Tensor,
@@ -181,13 +214,23 @@ def post_reorder_native(
     start_expert_id: int,
     end_expert_id: int,
 ) -> torch.Tensor:
-    valid_mask = (topk_ids >= start_expert_id) & (topk_ids <= end_expert_id)  # [N, topk]
-    # down_output[src2dst] returns a tensor of shape [N, topk, hidden_size]
-    gathered = down_output[src2dst]
-    weighted = gathered * topk_weights.unsqueeze(-1)  # [N, topk, hidden_size]
-    weighted = weighted * valid_mask.unsqueeze(-1).to(down_output.dtype)
-    output = weighted.sum(dim=1)  # [N, hidden_size]
+    M, topk = topk_ids.shape
+    hidden_size = down_output.shape[1]
+    output = torch.empty((M, hidden_size), device=down_output.device, dtype=down_output.dtype)
     
+    for i in range(M):
+        computed = False
+        sum_vec = torch.zeros(hidden_size, device=down_output.device, dtype=down_output.dtype)
+        for j in range(topk):
+            expert_id = int(topk_ids[i, j].item())
+            if start_expert_id <= expert_id <= end_expert_id:
+                computed = True
+                dst_idx = int(src2dst[i * topk + j].item())
+                weight = topk_weights[i, j].to(down_output.dtype)
+                sum_vec += down_output[dst_idx, :] * weight
+        if not computed:
+            sum_vec.zero_()
+        output[i, :] = sum_vec
     return output
 
 class EPMoE(torch.nn.Module):
@@ -332,7 +375,7 @@ class EPMoE(torch.nn.Module):
         #     BLOCK_SIZE=512,
         # )
         gateup_input = pre_reorder_native(hidden_states, src2dst, topk_ids, self.w13_input_scale,
-                                          self.start_expert_id, self.end_expert_id, self.topk, hidden_states.shape[1])
+                                          self.start_expert_id, self.end_expert_id, self.top_k, hidden_states.shape[1])
 
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
@@ -365,11 +408,6 @@ class EPMoE(torch.nn.Module):
             ),
             block_shape=self.block_shape,
         )
-        # seg_indptr_cur = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
-        # w13_weight: [num_experts_per_partition, 2 * intermediate_size, hidden_size]
-        # gateup_output = grouped_gemm_native(
-        #     gateup_input, self.w13_weight, seg_indptr_cur, self.start_expert_id, self.end_expert_id
-        # )
 
         # Act
         down_input = torch.empty(
@@ -390,42 +428,45 @@ class EPMoE(torch.nn.Module):
             )
 
         if self.activation == "silu":
-            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+            # silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+            #     gateup_output,
+            #     down_input,
+            #     gateup_output.shape[1],
+            #     reorder_topk_ids,
+            #     self.w2_input_scale,
+            #     self.start_expert_id,
+            #     self.end_expert_id,
+            #     BLOCK_SIZE=512,
+            # )
+            down_input = silu_and_mul_native(
                 gateup_output,
-                down_input,
                 gateup_output.shape[1],
                 reorder_topk_ids,
                 self.w2_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
-                BLOCK_SIZE=512,
             )
         elif self.activation == "gelu":
-            gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+            # gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+            #     gateup_output,
+            #     down_input,
+            #     gateup_output.shape[1],
+            #     reorder_topk_ids,
+            #     self.w2_input_scale,
+            #     self.start_expert_id,
+            #     self.end_expert_id,
+            #     BLOCK_SIZE=512,
+            # )
+            down_input = gelu_and_mul_native(
                 gateup_output,
-                down_input,
                 gateup_output.shape[1],
                 reorder_topk_ids,
                 self.w2_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
-                BLOCK_SIZE=512,
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
-        # half_dim = gateup_output.shape[1] // 2
-        # gate_part = gateup_output[:, :half_dim]
-        # up_part = gateup_output[:, half_dim:]
-        # scales = 1.0 / self.w2_input_scale[(reorder_topk_ids - self.start_expert_id).long()] \
-        #     if self.w2_input_scale is not None else 1.0
-        # scales = scales.unsqueeze(1)  # [M, 1]
-        # if self.activation == "silu":
-        #     activated = gate_part * torch.sigmoid(gate_part)
-        # elif self.activation == "gelu":
-        #     activated = F.gelu(gate_part)
-        # else:
-        #     raise ValueError(f"Unsupported activation: {self.activation}")
-        # down_input = activated * up_part * scales
 
         # GroupGemm-1
         down_output = torch.empty(
@@ -451,9 +492,6 @@ class EPMoE(torch.nn.Module):
             ),
             block_shape=self.block_shape,
         )
-        # down_output = grouped_gemm_native(
-        #     down_input, self.w2_weight, seg_indptr_cur, self.start_expert_id, self.end_expert_id
-        # )
 
         # PostReorder
         # output = torch.empty_like(hidden_states)
