@@ -151,7 +151,7 @@ def silu_and_mul_native(
 ) -> torch.Tensor:
     half_hidden_size = hidden_size // 2
     M = gateup_output.shape[0]
-    down_input = torch.zeros((M, half_hidden_size), device=gateup_output.device, dtype=gateup_output.dtype)
+    down_input = torch.zeros((M, half_hidden_size), device=gateup_output.device, dtype=dtype)
 
     for pid in range(M):
         expert_id = int(reorder_topk_ids[pid].item())
@@ -162,13 +162,13 @@ def silu_and_mul_native(
 
             if scales is not None:
                 scale_val = scales[expert_id - start_expert_id]
-                scale = (1.0 / scale_val).to(gateup_output.dtype)
+                scale = (1.0 / scale_val).to(dtype)
             else:
                 scale = 1.0
 
             gate_float = gate_output.to(torch.float32)
             silu_output = gate_float * torch.sigmoid(gate_float)
-            silu_output = silu_output.to(gateup_output.dtype)
+            silu_output = silu_output.to(dtype)
 
             result = silu_output * up_output * scale
             down_input[pid] = result
