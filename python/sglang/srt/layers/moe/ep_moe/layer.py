@@ -246,6 +246,41 @@ def post_reorder_native(
         output[i, :] = sum_vec
     return output
 
+def grouped_gemm_runner_native(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    batch_size: int,
+    weight_column_major: bool,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    use_fp8_w8a8: bool = False,
+    scale_a: Optional[torch.Tensor] = None,
+    scale_b: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if not weight_column_major:
+        raise ValueError("Only weight_column_major=True is supported in this native implementation.")
+
+    N = b.size(1)  
+    c = torch.empty((a.size(0), N), device=a.device, dtype=a.dtype)
+
+    for i in range(batch_size):
+        start = int(seg_indptr[i])
+        end = int(seg_indptr[i + 1])
+        if end <= start:
+            continue 
+
+        expert_id = int(weight_indices[i])
+
+        result = a[start:end, :] @ b[expert_id].T
+
+        if use_fp8_w8a8:
+            if scale_a is None or scale_b is None:
+                raise ValueError("scale_a and scale_b must be provided when use_fp8_w8a8 is True.")
+            result = result * (scale_a[expert_id] * scale_b[expert_id])
+
+        c[start:end, :] = result
+    return c
+
 class EPMoE(torch.nn.Module):
     """
     MoE Expert Parallel Impl

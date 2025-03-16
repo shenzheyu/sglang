@@ -7,6 +7,7 @@ from sglang.srt.layers.moe.ep_moe.layer import (
     pre_reorder_native,
     pre_reorder_triton_kernel,
     GroupedGemmRunner,
+    grouped_gemm_runner_native,
     silu_and_mul_triton_kernel,
     silu_and_mul_native,
     gelu_and_mul_triton_kernel,
@@ -496,6 +497,100 @@ class TestPostReorderNative(unittest.TestCase):
         # print(f"Expected output: {expected_output}, got: {output}")
         torch.testing.assert_close(
             output, expected_output, rtol=1e-4, atol=1e-4
+        )
+
+class TestGroupedGemmRunnerNative(unittest.TestCase):
+    def test_random_input(self):
+        token_num = 4
+        hidden_size = 16
+        num_experts = 8
+        num_experts_per_partition = 2
+        top_k = 2
+        start_expert_id = 5
+        end_expert_id = 6
+        intermediate_size = 16
+
+        hidden_states = torch.randn(token_num, hidden_size).to("cuda:0")
+        router_logits = torch.randn(token_num, num_experts).to("cuda:0")
+        topk_weights = torch.randn(token_num, top_k).to("cuda:0")
+        topk_ids = torch.randint(0, num_experts, (token_num, top_k)).to(
+            "cuda:0"
+        )
+        w13_weight = torch.randn(
+            num_experts_per_partition,
+            2 * intermediate_size,
+            hidden_size,
+        ).to("cuda:0")
+
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
+            topk_ids, num_experts
+        )
+
+        max_value = (
+            torch.max(hidden_states)
+            .repeat(num_experts_per_partition)
+            .to(torch.float32)
+        )
+        w13_input_scale = max_value / torch.finfo(torch.float8_e4m3fn).max
+
+        gateup_input = pre_reorder_native(
+            hidden_states,
+            src2dst,
+            topk_ids,
+            w13_input_scale,
+            start_expert_id,
+            end_expert_id,
+            top_k,
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+        )
+
+        seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
+        weight_indices_cur_rank = torch.arange(
+            0,
+            num_experts_per_partition,
+            device=hidden_states.device,
+            dtype=torch.int64,
+        )
+
+        expected_gateup_output = torch.empty(
+            gateup_input.shape[0],
+            w13_weight.shape[1],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        grouped_gemm_runner = GroupedGemmRunner(
+            hidden_states.device,
+            use_flashinfer=False,
+        )
+        w13_weight_scale = torch.ones(
+            num_experts_per_partition, dtype=torch.float32
+        ).to("cuda:0")
+
+        expected_gateup_output = grouped_gemm_runner(
+            a=gateup_input,
+            b=w13_weight,
+            c=expected_gateup_output,
+            batch_size=num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=False,
+            scale_a=w13_input_scale,
+            scale_b=w13_weight_scale,
+            block_shape=None,
+        )
+
+        gateup_input = grouped_gemm_runner_native(
+            a=gateup_input,
+            b=w13_weight,
+            batch_size=num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=False,
+            scale_a=w13_input_scale,
+            scale_b=w13_weight_scale,
         )
 
 if __name__ == "__main__":
