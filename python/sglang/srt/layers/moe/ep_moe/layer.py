@@ -117,6 +117,7 @@ def pre_reorder_native(
     a1_scales: torch.Tensor,
     start_expert_id: int,
     end_expert_id: int,
+    active_expert_ids: List[int],
     topk: int,
     hidden_size: int,
     dtype: torch.dtype,
@@ -130,9 +131,10 @@ def pre_reorder_native(
         src = input[i]  # [hidden_size]
         for j in range(topk):
             expert_id = int(topk_ids[i, j].item())
-            if start_expert_id <= expert_id <= end_expert_id:
+            # if start_expert_id <= expert_id <= end_expert_id:
+            if expert_id in active_expert_ids:
                 if a1_scales is not None:
-                    scale = 1.0 / a1_scales[expert_id - start_expert_id]
+                    scale = 1.0 / a1_scales[active_expert_ids.index(expert_id)]
                 else:
                     scale = 1.0
                 dst_idx = int(src2dst[i * topk + j].item())
@@ -147,6 +149,7 @@ def silu_and_mul_native(
     scales: torch.Tensor,
     start_expert_id: int,
     end_expert_id: int,
+    active_expert_ids: List[int],
     dtype: torch.dtype,
 ) -> torch.Tensor:
     half_hidden_size = hidden_size // 2
@@ -155,13 +158,15 @@ def silu_and_mul_native(
 
     for pid in range(M):
         expert_id = int(reorder_topk_ids[pid].item())
-        if start_expert_id <= expert_id <= end_expert_id:
+        # if start_expert_id <= expert_id <= end_expert_id:
+        if expert_id in active_expert_ids:
             row = gateup_output[pid]
             gate_output = row[:half_hidden_size]
             up_output = row[half_hidden_size:]#.to(dtype)
 
             if scales is not None:
-                scale_val = scales[expert_id - start_expert_id]
+                # scale_val = scales[expert_id - start_expert_id]
+                scale_val = scales[active_expert_ids.index(expert_id)]
                 scale = (1.0 / scale_val)#.to(dtype)
             else:
                 scale = 1.0
@@ -184,6 +189,7 @@ def gelu_and_mul_native(
     scales: torch.Tensor,
     start_expert_id: int,
     end_expert_id: int,
+    active_expert_ids: List[int],
     dtype: torch.dtype,
 ) -> torch.Tensor:
     half_hidden_size = hidden_size // 2
@@ -195,13 +201,15 @@ def gelu_and_mul_native(
 
     for pid in range(M):
         expert_id = int(reorder_topk_ids[pid].item())
-        if start_expert_id <= expert_id <= end_expert_id:
+        # if start_expert_id <= expert_id <= end_expert_id:
+        if expert_id in active_expert_ids:
             row = gateup_output[pid]
             gate_output = row[:half_hidden_size]
             up_output = row[half_hidden_size:]
 
             if scales is not None:
-                scale_val = scales[expert_id - start_expert_id]
+                # scale_val = scales[expert_id - start_expert_id]
+                scale_val = scales[active_expert_ids.index(expert_id)]
                 scale = (1.0 / scale_val).to(dtype)
             else:
                 scale = 1.0
@@ -226,6 +234,7 @@ def post_reorder_native(
     topk_weights: torch.Tensor,
     start_expert_id: int,
     end_expert_id: int,
+    active_expert_ids: List[int],
 ) -> torch.Tensor:
     M, topk = topk_ids.shape
     hidden_size = down_output.shape[1]
@@ -236,7 +245,8 @@ def post_reorder_native(
         sum_vec = torch.zeros(hidden_size, device=down_output.device, dtype=down_output.dtype)
         for j in range(topk):
             expert_id = int(topk_ids[i, j].item())
-            if start_expert_id <= expert_id <= end_expert_id:
+            # if start_expert_id <= expert_id <= end_expert_id:
+            if expert_id in active_expert_ids:
                 computed = True
                 dst_idx = int(src2dst[i * topk + j].item())
                 weight = topk_weights[i, j].to(down_output.dtype)
@@ -251,7 +261,8 @@ def grouped_gemm_runner_native(
     b: torch.Tensor,
     batch_size: int,
     weight_column_major: bool,
-    seg_indptr: torch.Tensor,
+    # seg_indptr: torch.Tensor,
+    seg_ind_interval: List[Tuple[int, int]],
     weight_indices: torch.Tensor,
     use_fp8_w8a8: bool = False,
     scale_a: Optional[torch.Tensor] = None,
@@ -264,8 +275,9 @@ def grouped_gemm_runner_native(
     c = torch.empty((a.size(0), N), device=a.device, dtype=a.dtype)
 
     for i in range(batch_size):
-        start = int(seg_indptr[i])
-        end = int(seg_indptr[i + 1])
+        # start = int(seg_indptr[i])
+        # end = int(seg_indptr[i + 1])
+        start, end = seg_ind_interval[i]
         if end <= start:
             continue 
 
@@ -321,6 +333,7 @@ class EPMoE(torch.nn.Module):
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
+        self.active_expert_ids = list(range((self.tp_rank + 1) % 8, (self.tp_rank + 1) % 8 + self.num_experts_per_partition))
 
         self.top_k = top_k
         self.intermediate_size = intermediate_size
@@ -429,6 +442,7 @@ class EPMoE(torch.nn.Module):
             self.w13_input_scale,
             self.start_expert_id,
             self.end_expert_id,
+            self.active_expert_ids,
             self.top_k,
             hidden_states.shape[1],
             dtype=(
@@ -438,7 +452,11 @@ class EPMoE(torch.nn.Module):
             ),
         )
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        # seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        seg_ind_interval = [
+            (seg_indptr[expert_id], seg_indptr[expert_id + 1])
+            for expert_id in self.active_expert_ids
+        ]
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -446,20 +464,36 @@ class EPMoE(torch.nn.Module):
             dtype=torch.int64,
         )
         # GroupGemm-0
-        gateup_output = torch.empty(
-            gateup_input.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        gateup_output = self.grouped_gemm_runner(
-            a=gateup_input,
-            b=self.w13_weight,
-            c=gateup_output,
-            batch_size=self.num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
+        # gateup_output = torch.empty(
+        #     gateup_input.shape[0],
+        #     self.w13_weight.shape[1],
+        #     device=hidden_states.device,
+        #     dtype=hidden_states.dtype,
+        # )
+        # gateup_output = self.grouped_gemm_runner(
+        #     a=gateup_input,
+        #     b=self.w13_weight,
+        #     c=gateup_output,
+        #     batch_size=self.num_experts_per_partition,
+        #     weight_column_major=True,
+        #     seg_indptr=seg_indptr_cur_rank,
+        #     weight_indices=weight_indices_cur_rank,
+        #     use_fp8_w8a8=self.use_fp8_w8a8,
+        #     scale_a=self.w13_input_scale,
+        #     scale_b=(
+        #         self.w13_weight_scale_inv
+        #         if self.use_block_quant
+        #         else self.w13_weight_scale
+        #     ),
+        #     block_shape=self.block_shape,
+        # )
+        gateup_output = grouped_gemm_runner_native(
+            gateup_input,
+            self.w13_weight,
+            self.num_experts_per_partition,
+            True,
+            seg_ind_interval,
+            weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
             scale_a=self.w13_input_scale,
             scale_b=(
@@ -467,7 +501,6 @@ class EPMoE(torch.nn.Module):
                 if self.use_block_quant
                 else self.w13_weight_scale
             ),
-            block_shape=self.block_shape,
         )
 
         # Act
@@ -506,6 +539,7 @@ class EPMoE(torch.nn.Module):
                 self.w2_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
+                self.active_expert_ids,
                 dtype=(
                     self.fp8_dtype
                     if (self.use_fp8_w8a8 and not self.use_block_quant)
@@ -530,6 +564,7 @@ class EPMoE(torch.nn.Module):
                 self.w2_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
+                self.active_expert_ids,
                 dtype=(
                     self.fp8_dtype
                     if (self.use_fp8_w8a8 and not self.use_block_quant)
@@ -540,20 +575,36 @@ class EPMoE(torch.nn.Module):
             raise ValueError(f"Unsupported activation: {self.activation=}")
 
         # GroupGemm-1
-        down_output = torch.empty(
-            down_input.shape[0],
-            self.w2_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        down_output = self.grouped_gemm_runner(
-            a=down_input,
-            b=self.w2_weight,
-            c=down_output,
-            batch_size=self.num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
+        # down_output = torch.empty(
+        #     down_input.shape[0],
+        #     self.w2_weight.shape[1],
+        #     device=hidden_states.device,
+        #     dtype=hidden_states.dtype,
+        # )
+        # down_output = self.grouped_gemm_runner(
+        #     a=down_input,
+        #     b=self.w2_weight,
+        #     c=down_output,
+        #     batch_size=self.num_experts_per_partition,
+        #     weight_column_major=True,
+        #     seg_indptr=seg_indptr_cur_rank,
+        #     weight_indices=weight_indices_cur_rank,
+        #     use_fp8_w8a8=self.use_fp8_w8a8,
+        #     scale_a=self.w2_input_scale,
+        #     scale_b=(
+        #         self.w2_weight_scale_inv
+        #         if self.use_block_quant
+        #         else self.w2_weight_scale
+        #     ),
+        #     block_shape=self.block_shape,
+        # )
+        down_output = grouped_gemm_runner_native(
+            down_input,
+            self.w2_weight,
+            self.num_experts_per_partition,
+            True,
+            seg_ind_interval,
+            weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
             scale_a=self.w2_input_scale,
             scale_b=(
@@ -561,7 +612,6 @@ class EPMoE(torch.nn.Module):
                 if self.use_block_quant
                 else self.w2_weight_scale
             ),
-            block_shape=self.block_shape,
         )
 
         # PostReorder
@@ -578,7 +628,15 @@ class EPMoE(torch.nn.Module):
         #     hidden_states.size(1),
         #     BLOCK_SIZE=512,
         # )
-        output = post_reorder_native(down_output, src2dst, topk_ids, topk_weights, self.start_expert_id, self.end_expert_id)
+        output = post_reorder_native(
+            down_output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            self.start_expert_id,
+            self.end_expert_id,
+            self.active_expert_ids,
+        )
         return output
 
     @classmethod
@@ -617,9 +675,12 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+        # if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+        #     return
+        if expert_id not in self.active_expert_ids:
             return
-        expert_id = expert_id - self.start_expert_id
+        # expert_id = expert_id - self.start_expert_id
+        expert_id = self.active_expert_ids.index(expert_id)
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
