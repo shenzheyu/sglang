@@ -282,15 +282,18 @@ def grouped_gemm_runner_native(
             continue 
 
         expert_id = int(weight_indices[i])
-
+        #a_fp16 = a[start:end, :].to(dtype=torch.float16)
+        #b_fp16 = b[expert_id].to(dtype=torch.float16)
+        # triton support below fp8(e4m3fn), but pytorch does not.
         result = a[start:end, :] @ b[expert_id].T
+        #result = a_fp16 @ b_fp16.T
 
         if use_fp8_w8a8:
             if scale_a is None or scale_b is None:
                 raise ValueError("scale_a and scale_b must be provided when use_fp8_w8a8 is True.")
             result = result * (scale_a[expert_id] * scale_b[expert_id])
 
-        c[start:end, :] = result
+        c[start:end, :] = result#.to(dtype=c.dtype)
     return c
 
 class EPMoE(torch.nn.Module):
