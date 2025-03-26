@@ -309,6 +309,7 @@ class EPMoE(torch.nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         use_grouped_topk: bool = False,
@@ -334,9 +335,16 @@ class EPMoE(torch.nn.Module):
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
+
+        self.layer_id = layer_id
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
-        self.active_expert_ids = list(range((self.tp_rank + 1) % 8, (self.tp_rank + 1) % 8 + self.num_experts_per_partition))
+        if self.layer_id == 31:
+            self.active_expert_ids = list(range((self.tp_rank + 1) % 8, (self.tp_rank + 1) % 8 + self.num_experts_per_partition))
+        elif self.layer_id == 32:
+            self.active_expert_ids = list(range((self.tp_rank + 2) % 8, (self.tp_rank + 2) % 8 + self.num_experts_per_partition))
+        else:
+            self.active_expert_ids = list(range(self.start_expert_id, self.end_expert_id + 1))
 
         self.top_k = top_k
         self.intermediate_size = intermediate_size
