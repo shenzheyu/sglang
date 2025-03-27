@@ -72,6 +72,7 @@ class MixtralMoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = hidden_size
+        self.layer_id = layer_id
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -103,7 +104,8 @@ class MixtralMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(hidden_states, router_logits)
-        if self.tp_size > 1:
+        fix_layer_ids = [31, 30, 29, 28, 27]
+        if self.tp_size > 1 and self.layer_id not in fix_layer_ids:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
 

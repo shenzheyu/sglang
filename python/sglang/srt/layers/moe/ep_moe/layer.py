@@ -339,10 +339,16 @@ class EPMoE(torch.nn.Module):
         self.layer_id = layer_id
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
-        if self.layer_id == 31:
-            self.active_expert_ids = list(range((self.tp_rank + 1) % 8, (self.tp_rank + 1) % 8 + self.num_experts_per_partition))
-        elif self.layer_id == 32:
-            self.active_expert_ids = list(range((self.tp_rank + 2) % 8, (self.tp_rank + 2) % 8 + self.num_experts_per_partition))
+
+        fix_expert_location = {
+            31: [[0], [1], [2], [3], [4], [5], [6], [7]],
+            30: [[7], [3], [1], [5], [6], [2], [4], [0]],
+            29: [[7], [1], [2], [6], [3], [5], [4], [0]],
+            28: [[2], [4], [6], [3], [5], [7], [0], [1]],
+            27: [[7], [1], [0], [5], [2], [3], [4], [6]],
+        }
+        if self.layer_id in fix_expert_location.keys():
+            self.active_expert_ids = fix_expert_location[self.layer_id][self.tp_rank]
         else:
             self.active_expert_ids = list(range(self.start_expert_id, self.end_expert_id + 1))
 
