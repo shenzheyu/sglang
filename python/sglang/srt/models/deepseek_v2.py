@@ -137,6 +137,7 @@ class DeepseekV2MoE(nn.Module):
 
     def __init__(
         self,
+        layer_id: int,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -166,6 +167,7 @@ class DeepseekV2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            layer_id=layer_id,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=True,
@@ -941,6 +943,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % config.moe_layer_freq == 0
         ):
             self.mlp = DeepseekV2MoE(
+                layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
