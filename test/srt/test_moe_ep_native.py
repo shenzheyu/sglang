@@ -53,6 +53,7 @@ class TestPreReorderNative(unittest.TestCase):
         top_k = 2
         start_expert_id = 5
         end_expert_id = 6
+        active_expert_ids = [5, 6]
 
         hidden_states = torch.randn(token_num, hidden_size).to("cuda:0")
         router_logits = torch.randn(token_num, num_experts).to("cuda:0")
@@ -98,6 +99,7 @@ class TestPreReorderNative(unittest.TestCase):
             w13_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             top_k,
             hidden_states.shape[1],
             dtype=hidden_states.dtype,
@@ -120,6 +122,7 @@ class TestSiluAndMulNative(unittest.TestCase):
         top_k = 2
         start_expert_id = 5
         end_expert_id = 6
+        active_expert_ids = [5, 6]
         intermediate_size = 16
 
         hidden_states = torch.randn(token_num, hidden_size).to("cuda:0")
@@ -152,12 +155,17 @@ class TestSiluAndMulNative(unittest.TestCase):
             w13_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             top_k,
             hidden_states.shape[1],
             dtype=hidden_states.dtype,
         )
 
         seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
+        seg_ind_interval = [
+            (seg_indptr[expert_id], seg_indptr[expert_id + 1])
+            for expert_id in active_expert_ids
+        ]
         weight_indices_cur_rank = torch.arange(
             0,
             num_experts_per_partition,
@@ -222,6 +230,7 @@ class TestSiluAndMulNative(unittest.TestCase):
             w2_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             dtype=hidden_states.dtype,
         )
 
@@ -240,6 +249,7 @@ class TestGeluAndMulNative(unittest.TestCase):
         top_k = 2
         start_expert_id = 5
         end_expert_id = 6
+        active_expert_ids = [5, 6]
         intermediate_size = 16
 
         hidden_states = torch.randn(token_num, hidden_size).to("cuda:0")
@@ -272,12 +282,17 @@ class TestGeluAndMulNative(unittest.TestCase):
             w13_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             top_k,
             hidden_states.shape[1],
             dtype=hidden_states.dtype,
         )
 
         seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
+        seg_ind_interval = [
+            (seg_indptr[expert_id], seg_indptr[expert_id + 1])
+            for expert_id in active_expert_ids
+        ]
         weight_indices_cur_rank = torch.arange(
             0,
             num_experts_per_partition,
@@ -342,6 +357,7 @@ class TestGeluAndMulNative(unittest.TestCase):
             w2_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             dtype=hidden_states.dtype,
         )
 
@@ -360,6 +376,7 @@ class TestPostReorderNative(unittest.TestCase):
         top_k = 2
         start_expert_id = 5
         end_expert_id = 6
+        active_expert_ids = [5, 6]
         intermediate_size = 16
 
         hidden_states = torch.randn(token_num, hidden_size).to("cuda:0")
@@ -392,12 +409,17 @@ class TestPostReorderNative(unittest.TestCase):
             w13_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             top_k,
             hidden_states.shape[1],
             dtype=hidden_states.dtype,
         )
 
         seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
+        seg_ind_interval = [
+            (seg_indptr[expert_id], seg_indptr[expert_id + 1])
+            for expert_id in active_expert_ids
+        ]
         weight_indices_cur_rank = torch.arange(
             0,
             num_experts_per_partition,
@@ -446,6 +468,7 @@ class TestPostReorderNative(unittest.TestCase):
             w2_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             hidden_states.dtype,
         )
 
@@ -492,7 +515,7 @@ class TestPostReorderNative(unittest.TestCase):
             hidden_states.size(1),
             BLOCK_SIZE=512,
         )
-        output = post_reorder_native(down_output, src2dst, topk_ids, topk_weights, start_expert_id, end_expert_id)
+        output = post_reorder_native(down_output, src2dst, topk_ids, topk_weights, start_expert_id, end_expert_id, active_expert_ids)
 
         # print(f"Expected output: {expected_output}, got: {output}")
         torch.testing.assert_close(
@@ -508,6 +531,7 @@ class TestGroupedGemmRunnerNative(unittest.TestCase):
         top_k = 2
         start_expert_id = 5
         end_expert_id = 6
+        active_expert_ids = [5, 6]
         intermediate_size = 16
 
         hidden_states = torch.randn(token_num, hidden_size).to("cuda:0")
@@ -540,12 +564,17 @@ class TestGroupedGemmRunnerNative(unittest.TestCase):
             w13_input_scale,
             start_expert_id,
             end_expert_id,
+            active_expert_ids,
             top_k,
             hidden_states.shape[1],
             dtype=hidden_states.dtype,
         )
 
         seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
+        seg_ind_interval = [
+            (seg_indptr[expert_id], seg_indptr[expert_id + 1])
+            for expert_id in active_expert_ids
+        ]
         weight_indices_cur_rank = torch.arange(
             0,
             num_experts_per_partition,
@@ -586,7 +615,7 @@ class TestGroupedGemmRunnerNative(unittest.TestCase):
             b=w13_weight,
             batch_size=num_experts_per_partition,
             weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
+            seg_ind_interval=seg_ind_interval,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=False,
             scale_a=w13_input_scale,

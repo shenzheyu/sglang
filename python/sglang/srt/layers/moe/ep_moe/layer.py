@@ -127,17 +127,22 @@ def pre_reorder_native(
         (token_num * topk, hidden_size), device=input.device, dtype=dtype
     )
 
+    topk_ids_list = topk_ids.tolist()
+    src2dst_list = src2dst.tolist()
+
     for i in range(token_num):
         src = input[i]  # [hidden_size]
         for j in range(topk):
-            expert_id = int(topk_ids[i, j].item())
+            # expert_id = int(topk_ids[i, j].item())
+            expert_id = topk_ids_list[i][j]
             # if start_expert_id <= expert_id <= end_expert_id:
             if expert_id in active_expert_ids:
                 if a1_scales is not None:
                     scale = 1.0 / a1_scales[active_expert_ids.index(expert_id)]
                 else:
                     scale = 1.0
-                dst_idx = int(src2dst[i * topk + j].item())
+                # dst_idx = int(src2dst[i * topk + j].item())
+                dst_idx = src2dst_list[i * topk + j]
                 scaled = (src.to(torch.float32) * scale).to(dtype)
                 out[dst_idx, :] = scaled
     return out
@@ -156,8 +161,10 @@ def silu_and_mul_native(
     M = gateup_output.shape[0]
     down_input = torch.zeros((M, half_hidden_size), device=gateup_output.device, dtype=dtype)
 
+    reorder_topk_ids_list = reorder_topk_ids.tolist()
+
     for pid in range(M):
-        expert_id = int(reorder_topk_ids[pid].item())
+        expert_id = reorder_topk_ids_list[pid]
         # if start_expert_id <= expert_id <= end_expert_id:
         if expert_id in active_expert_ids:
             row = gateup_output[pid]
@@ -199,8 +206,10 @@ def gelu_and_mul_native(
     
     kAlpha = 0.7978845608028654
 
+    reorder_topk_ids_list = reorder_topk_ids.tolist()
+
     for pid in range(M):
-        expert_id = int(reorder_topk_ids[pid].item())
+        expert_id = reorder_topk_ids_list[pid]
         # if start_expert_id <= expert_id <= end_expert_id:
         if expert_id in active_expert_ids:
             row = gateup_output[pid]
@@ -239,16 +248,19 @@ def post_reorder_native(
     M, topk = topk_ids.shape
     hidden_size = down_output.shape[1]
     output = torch.empty((M, hidden_size), device=down_output.device, dtype=down_output.dtype)
+
+    topk_ids_list = topk_ids.tolist()
+    src2dst_list = src2dst.tolist()
     
     for i in range(M):
         computed = False
         sum_vec = torch.zeros(hidden_size, device=down_output.device, dtype=down_output.dtype)
         for j in range(topk):
-            expert_id = int(topk_ids[i, j].item())
+            expert_id = topk_ids_list[i][j]
             # if start_expert_id <= expert_id <= end_expert_id:
             if expert_id in active_expert_ids:
                 computed = True
-                dst_idx = int(src2dst[i * topk + j].item())
+                dst_idx = src2dst_list[i * topk + j]
                 weight = topk_weights[i, j].to(down_output.dtype)
                 sum_vec += down_output[dst_idx, :] * weight
         if not computed:
@@ -274,6 +286,8 @@ def grouped_gemm_runner_native(
     N = b.size(1)  
     c = torch.empty((a.size(0), N), device=a.device, dtype=a.dtype)
 
+    weight_indices_list = weight_indices.tolist()
+
     for i in range(batch_size):
         # start = int(seg_indptr[i])
         # end = int(seg_indptr[i + 1])
@@ -281,12 +295,9 @@ def grouped_gemm_runner_native(
         if end <= start:
             continue 
 
-        expert_id = int(weight_indices[i])
-        #a_fp16 = a[start:end, :].to(dtype=torch.float16)
-        #b_fp16 = b[expert_id].to(dtype=torch.float16)
+        expert_id = weight_indices_list[i]
         # triton support below fp8(e4m3fn), but pytorch does not.
         result = a[start:end, :] @ b[expert_id].T
-        #result = a_fp16 @ b_fp16.T
 
         if use_fp8_w8a8:
             if scale_a is None or scale_b is None:
